@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Callable
 
 from crewai import Agent, Crew, Process, Task, LLM
 
@@ -102,10 +102,16 @@ def _fingerprint(paths: list[Path]) -> dict[str, str]:
     return result
 
 
-def _read_document(path: Path) -> str:
+def _read_document(path: Path, progress: Callable[[str, float], None] | None = None) -> str:
     if path.suffix.lower() == ".pdf":
         reader = PdfReader(str(path))
-        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+        pages = []
+        total = len(reader.pages)
+        for number, page in enumerate(reader.pages, 1):
+            pages.append(page.extract_text() or "")
+            if progress and (number == 1 or number % 10 == 0 or number == total):
+                progress(f"Reading {path.name} · page {number}/{total}", number / max(total, 1))
+        text = "\n".join(pages)
     else:
         text = path.read_text(encoding="utf-8", errors="ignore")
     # Some PDF font maps produce lone UTF-16 surrogates. They are Python
@@ -128,10 +134,16 @@ def _chunks(text: str, size: int = 1200, overlap: int = 180) -> list[str]:
     return chunks
 
 
-def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
+def ensure_index(progress: Callable[[str, float], None] | None = None) -> tuple[Any, list[dict], SentenceTransformer]:
+    def report(message, fraction):
+        if progress:
+            progress(message, fraction)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    report("Finding local research documents", 0.01)
     docs = _discover_documents()
+    report("Loading MiniLM · first use may download the model", 0.03)
     model = _embedding_model()
+    report("Checking document contents against the saved index", 0.07)
     manifest = {
         "schema": 2,
         "documents": _fingerprint(docs),
@@ -154,14 +166,19 @@ def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
                         and all(isinstance(item, dict) and isinstance(item.get("text"), str)
                                 and {"source", "category", "chunk"} <= item.keys()
                                 for item in metadata)):
+                    report(f"Saved research index ready · {index.ntotal:,} chunks", 1.0)
                     return index, metadata, model
         except Exception:
             pass
 
     metadata, texts = [], []
-    for path in docs:
+    for document_number, path in enumerate(docs):
         category = path.parent.name
-        for idx, chunk in enumerate(_chunks(_read_document(path))):
+        report(f"Reading document {document_number+1}/{len(docs)} · {path.name}",
+               .1 + .35 * document_number / max(len(docs), 1))
+        def page_progress(message, fraction):
+            report(message, .1 + .35 * (document_number + fraction) / max(len(docs), 1))
+        for idx, chunk in enumerate(_chunks(_read_document(path, page_progress))):
             texts.append(chunk)
             metadata.append({
                 "source": str(path.relative_to(KB_DIR)),
@@ -171,24 +188,34 @@ def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
             })
 
     if texts:
-        vectors = _encode_texts(model, texts)
+        batches = []
+        # Same MiniLM model, normalization and default batch size as before;
+        # expose actual completion instead of hiding the entire encode call.
+        for start in range(0, len(texts), 32):
+            end = min(start + 32, len(texts))
+            report(f"Embedding research · {start:,}/{len(texts):,} chunks", .45 + .5 * start / len(texts))
+            batches.append(_encode_texts(model, texts[start:end]))
+        vectors = np.ascontiguousarray(np.vstack(batches), dtype="float32")
         index = faiss.IndexFlatIP(vectors.shape[1])
         index.add(vectors)
     else:
         index = faiss.IndexFlatIP(model.get_sentence_embedding_dimension())
 
+    report("Saving the research index", .97)
     faiss.write_index(index, str(INDEX_FILE))
     META_FILE.write_bytes(pickle.dumps(metadata))
     MANIFEST_FILE.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    report(f"Research index ready · {index.ntotal:,} chunks", 1.0)
     return index, metadata, model
 
 
-def retrieve_context(query: str, top_k: int = 4, categories: list[str] | None = None) -> list[dict]:
+def retrieve_context(query: str, top_k: int = 4, categories: list[str] | None = None,
+                     *, progress: Callable[[str, float], None] | None = None) -> list[dict]:
     if not isinstance(query, str) or not query.strip():
         raise ValueError("Retrieval query must be a non-empty string.")
     if top_k <= 0:
         return []
-    index, metadata, model = ensure_index()
+    index, metadata, model = ensure_index(progress)
     if index.ntotal == 0:
         return []
     vector = _encode_texts(model, [query])
