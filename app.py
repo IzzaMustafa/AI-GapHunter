@@ -30,7 +30,11 @@ from final_agent import run_final_agent
 
 
 st.set_page_config(page_title="GapHunter AI | Opportunity Studio", page_icon="✦", layout="wide")
-st.markdown("<style>" + Path(__file__).with_name("theme.css").read_text(encoding="utf-8") + "</style>", unsafe_allow_html=True)
+theme_path = Path(__file__).with_name("theme.css")
+if not theme_path.is_file():
+    st.error("theme.css is missing from this deployment. Upload it beside app.py on the branch deployed by Streamlit, commit the change, and reboot the app.")
+    st.stop()
+st.markdown("<style>" + theme_path.read_text(encoding="utf-8") + "</style>", unsafe_allow_html=True)
 
 STAGES = [
     ("profile", "Profile", "Understanding your profile", "Maps your skills, interests and constraints."),
@@ -112,6 +116,7 @@ def get_api_key() -> str | None:
 def safe_stage(label, fn, *args):
     key = STAGE_KEYS.get(label)
     start = time.monotonic()
+    print(f"[GapHunter] Starting stage: {label}", flush=True)
     if key:
         st.session_state.agent_activity[key] = {"state": "running"}
         render_activity()
@@ -124,8 +129,10 @@ def safe_stage(label, fn, *args):
         if key:
             st.session_state.agent_activity[key] = {"state": "done", "seconds": round(time.monotonic() - start, 1)}
             render_activity()
+        print(f"[GapHunter] Completed stage: {label} · {time.monotonic() - start:.1f}s", flush=True)
         return result
     except Exception as exc:
+        print(f"[GapHunter] Failed stage: {label} · {type(exc).__name__}", flush=True)
         if key:
             st.session_state.agent_activity[key] = {"state": "error", "seconds": round(time.monotonic() - start, 1)}
             render_activity()
@@ -176,6 +183,28 @@ def demo_analysis():
 
 
 
+def research_context(query, top_k, categories):
+    with st.status("Preparing local research before the next agent", expanded=True) as status:
+        st.caption("First-time PDF extraction and indexing can take several minutes. The index is reused while it remains available and the documents stay unchanged.")
+        bar = st.progress(0, text="Preparing research")
+        previous_phase = None
+        def update(message, fraction):
+            nonlocal previous_phase
+            bar.progress(min(max(fraction, 0), 1), text=message)
+            # Log phase changes, not every page or chunk, and never profile/API data.
+            phase = message.split(" · ")[0]
+            if phase != previous_phase:
+                print(f"[GapHunter] Research: {message}", flush=True)
+                previous_phase = phase
+        try:
+            context = retrieve_context(query, top_k, categories, progress=update)
+            status.update(label=f"Research ready · {len(context)} relevant chunks retrieved", state="complete", expanded=False)
+            return context
+        except Exception as exc:
+            status.update(label=f"Research preparation failed · {type(exc).__name__}", state="error", expanded=True)
+            raise
+
+
 def compact_query(*items) -> str:
     return " ".join(json.dumps(x, ensure_ascii=False)[:2500] for x in items)
 
@@ -184,16 +213,16 @@ def run_pipeline(profile: dict, api_key: str):
     render_activity()
     profile_a = safe_stage("Understanding your profile", run_profile_agent, profile, api_key)
 
-    problem_ctx = retrieve_context(compact_query(profile, profile_a), 4, ["research", "pakistan", "market"])
+    problem_ctx = research_context(compact_query(profile, profile_a), 4, ["research", "pakistan", "market"])
     problems = safe_stage("Hunting for problems", run_problem_agent, profile_a, profile, problem_ctx, api_key)
 
-    market_ctx = retrieve_context(compact_query(profile_a, problems), 4, ["market", "research", "pakistan"])
+    market_ctx = research_context(compact_query(profile_a, problems), 4, ["market", "research", "pakistan"])
     market = safe_stage("Researching market trends", run_market_agent, profile_a, problems, market_ctx, api_key)
 
-    comp_ctx = retrieve_context(compact_query(problems, market), 5, ["startups", "market", "pakistan"])
+    comp_ctx = research_context(compact_query(problems, market), 5, ["startups", "market", "pakistan"])
     competitors = safe_stage("Investigating existing solutions", run_competitor_agent, problems, market, comp_ctx, api_key)
 
-    gap_ctx = retrieve_context(compact_query(problems, competitors), 4, ["startups", "market", "research", "pakistan"])
+    gap_ctx = research_context(compact_query(problems, competitors), 4, ["startups", "market", "research", "pakistan"])
     gaps = safe_stage("Searching for gaps", run_gap_agent, profile_a, problems, market, competitors, gap_ctx, api_key)
 
     innovation = safe_stage("Exploring unique angles", run_innovation_agent, gaps, profile_a, api_key, None)
