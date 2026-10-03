@@ -50,6 +50,8 @@ def _run(role: str, goal: str, backstory: str, description: str,
 from pathlib import Path
 import hashlib
 import pickle
+from functools import lru_cache
+from importlib.metadata import version
 
 import faiss
 import numpy as np
@@ -62,6 +64,24 @@ INDEX_FILE = INDEX_DIR / "index.faiss"
 META_FILE = INDEX_DIR / "metadata.pkl"
 MANIFEST_FILE = INDEX_DIR / "manifest.json"
 EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+@lru_cache(maxsize=1)
+def _embedding_model() -> SentenceTransformer:
+    return SentenceTransformer(EMBED_MODEL)
+
+
+def _encode_texts(model: SentenceTransformer, texts: list[str]) -> np.ndarray:
+    # Reject invalid input at its source; do not stringify objects or hide failures.
+    if not texts or any(not isinstance(text, str) or not text.strip() for text in texts):
+        raise ValueError("Embedding input must be a non-empty list of non-empty strings.")
+    vectors = model.encode(texts, normalize_embeddings=True,
+                           show_progress_bar=False, convert_to_numpy=True)
+    vectors = np.ascontiguousarray(vectors, dtype="float32")
+    if (vectors.ndim != 2 or vectors.shape != (len(texts), model.get_sentence_embedding_dimension())
+            or not np.isfinite(vectors).all()):
+        raise ValueError("Embedding model returned invalid vectors.")
+    return vectors
 
 
 def _discover_documents() -> list[Path]:
@@ -77,19 +97,21 @@ def _discover_documents() -> list[Path]:
 def _fingerprint(paths: list[Path]) -> dict[str, str]:
     result = {}
     for path in paths:
-        stat = path.stat()
         key = str(path.relative_to(KB_DIR))
-        result[key] = hashlib.sha256(
-            f"{stat.st_size}:{stat.st_mtime_ns}".encode()
-        ).hexdigest()
+        result[key] = hashlib.sha256(path.read_bytes()).hexdigest()
     return result
 
 
 def _read_document(path: Path) -> str:
     if path.suffix.lower() == ".pdf":
         reader = PdfReader(str(path))
-        return "\n".join((page.extract_text() or "") for page in reader.pages)
-    return path.read_text(encoding="utf-8", errors="ignore")
+        text = "\n".join((page.extract_text() or "") for page in reader.pages)
+    else:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    # Some PDF font maps produce lone UTF-16 surrogates. They are Python
+    # strings, but Rust tokenizers cannot convert them to valid UTF-8 text.
+    # Replace only those invalid code points, preserving other Unicode.
+    return re.sub(r"[\ud800-\udfff]", "\ufffd", text)
 
 
 def _chunks(text: str, size: int = 1200, overlap: int = 180) -> list[str]:
@@ -109,14 +131,30 @@ def _chunks(text: str, size: int = 1200, overlap: int = 180) -> list[str]:
 def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     docs = _discover_documents()
-    manifest = _fingerprint(docs)
-    model = SentenceTransformer(EMBED_MODEL)
+    model = _embedding_model()
+    manifest = {
+        "schema": 2,
+        "documents": _fingerprint(docs),
+        "embedding_model": EMBED_MODEL,
+        "embedding_dimension": model.get_sentence_embedding_dimension(),
+        "embedding_packages": {name: version(name) for name in
+                               ("sentence-transformers", "transformers", "tokenizers")},
+        "chunk_size": 1200,
+        "chunk_overlap": 180,
+        "normalize_embeddings": True,
+    }
 
     if INDEX_FILE.exists() and META_FILE.exists() and MANIFEST_FILE.exists():
         try:
             old = json.loads(MANIFEST_FILE.read_text(encoding="utf-8"))
             if old == manifest:
-                return faiss.read_index(str(INDEX_FILE)), pickle.loads(META_FILE.read_bytes()), model
+                index = faiss.read_index(str(INDEX_FILE))
+                metadata = pickle.loads(META_FILE.read_bytes())
+                if (index.d == manifest["embedding_dimension"] and index.ntotal == len(metadata)
+                        and all(isinstance(item, dict) and isinstance(item.get("text"), str)
+                                and {"source", "category", "chunk"} <= item.keys()
+                                for item in metadata)):
+                    return index, metadata, model
         except Exception:
             pass
 
@@ -133,12 +171,11 @@ def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
             })
 
     if texts:
-        vectors = model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-        vectors = np.asarray(vectors, dtype="float32")
+        vectors = _encode_texts(model, texts)
         index = faiss.IndexFlatIP(vectors.shape[1])
         index.add(vectors)
     else:
-        index = faiss.IndexFlatIP(384)
+        index = faiss.IndexFlatIP(model.get_sentence_embedding_dimension())
 
     faiss.write_index(index, str(INDEX_FILE))
     META_FILE.write_bytes(pickle.dumps(metadata))
@@ -147,11 +184,15 @@ def ensure_index() -> tuple[Any, list[dict], SentenceTransformer]:
 
 
 def retrieve_context(query: str, top_k: int = 4, categories: list[str] | None = None) -> list[dict]:
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("Retrieval query must be a non-empty string.")
+    if top_k <= 0:
+        return []
     index, metadata, model = ensure_index()
     if index.ntotal == 0:
         return []
-    vector = model.encode([query], normalize_embeddings=True, show_progress_bar=False)
-    scores, ids = index.search(np.asarray(vector, dtype="float32"), min(max(top_k * 3, top_k), index.ntotal))
+    vector = _encode_texts(model, [query])
+    scores, ids = index.search(vector, min(max(top_k * 3, top_k), index.ntotal))
     results = []
     for score, idx in zip(scores[0], ids[0]):
         if idx < 0:
