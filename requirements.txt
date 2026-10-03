@@ -1,6 +1,7 @@
 streamlit>=1.40,<2
 crewai>=0.100,<2
 litellm>=1.50,<2
+tiktoken>=0.7,<1
 faiss-cpu>=1.8,<2
 sentence-transformers==3.4.1
 transformers==4.48.3
