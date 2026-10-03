@@ -2,6 +2,8 @@ streamlit>=1.40,<2
 crewai>=0.100,<2
 litellm>=1.50,<2
 faiss-cpu>=1.8,<2
-sentence-transformers>=3,<6
+sentence-transformers==3.4.1
+transformers==4.48.3
+tokenizers==0.21.0
 pypdf>=5,<7
 numpy>=1.26,<3
