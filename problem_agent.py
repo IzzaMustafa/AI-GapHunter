@@ -7,11 +7,15 @@ from typing import Any
 
 from crewai import Agent, Crew, Process, Task, LLM
 
+from prompt_budget import BudgetedLLM, CONTEXT_NOTE, compact_contexts, validate_task
+
 MODEL = "groq/openai/gpt-oss-120b"
 
 
 def _llm(api_key: str) -> LLM:
-    return LLM(model=MODEL, api_key=api_key, temperature=0.25)
+    return BudgetedLLM(model=MODEL, api_key=api_key, temperature=0.25,
+                       max_tokens=2000, reasoning_effort="low",
+                       timeout=90, max_retries=0, num_retries=0)
 
 
 def _parse_json(raw: Any) -> dict:
@@ -31,6 +35,7 @@ def _parse_json(raw: Any) -> dict:
 
 def _run(role: str, goal: str, backstory: str, description: str,
          expected_output: str, api_key: str) -> dict:
+    validate_task(description)
     agent = Agent(
         role=role,
         goal=goal,
@@ -38,6 +43,8 @@ def _run(role: str, goal: str, backstory: str, description: str,
         llm=_llm(api_key),
         verbose=False,
         allow_delegation=False,
+        max_iter=1,
+        max_retry_limit=0,
     )
     task = Task(
         description=description,
@@ -48,16 +55,19 @@ def _run(role: str, goal: str, backstory: str, description: str,
     return _parse_json(crew.kickoff())
 
 def run_problem_agent(profile_analysis: dict, profile: dict, rag_context: list[dict], api_key: str) -> dict:
+    context = compact_contexts({"profile": profile, "analysis": profile_analysis,
+                               "evidence": rag_context})
     return _run(
         "Problem Hunter",
         "Find specific, recurring and potentially painful real-world problems that fit the user.",
         "You avoid vague problem statements and separate evidence from hypotheses.",
-        f"""User profile:
-{json.dumps(profile, ensure_ascii=False)}
+        f"""{CONTEXT_NOTE}
+User profile:
+{context['profile']}
 Profile analysis:
-{json.dumps(profile_analysis, ensure_ascii=False)}
+{context['analysis']}
 Retrieved knowledge-base evidence:
-{json.dumps(rag_context, ensure_ascii=False)}
+{context['evidence']}
 
 Generate 4 to 6 candidate problems. Return ONLY JSON:
 {{"problems":[{{"problem":"", "affected_users":[], "pain_or_inefficiency":"",
