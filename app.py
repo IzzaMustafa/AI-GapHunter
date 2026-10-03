@@ -3,6 +3,17 @@ from __future__ import annotations
 import json
 import streamlit as st
 
+# CrewAI 1.14/1.15 may add an Anthropic-only ``cache_breakpoint``
+# field to agent messages. Groq rejects that unsupported field. Disable
+# CrewAI's marker before importing/creating any agents.
+try:
+    import crewai.llms.cache as _crewai_cache
+
+    _crewai_cache.mark_cache_breakpoint = lambda message: message
+except (ImportError, AttributeError):
+    # Newer CrewAI versions may already handle provider compatibility.
+    pass
+
 from profile_agent import run_profile_agent
 from problem_agent import run_problem_agent
 from market_agent import retrieve_context, run_market_agent
