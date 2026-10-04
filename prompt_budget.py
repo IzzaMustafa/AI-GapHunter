@@ -4,6 +4,7 @@ from __future__ import annotations
 from functools import lru_cache
 import json
 import math
+import copy
 import time
 from typing import Any, Callable
 
@@ -67,7 +68,56 @@ def compact_contexts(sections: dict[str, Any]) -> dict[str, str]:
             compacted = _compact(sections, leaf_tokens, list_items)
             if count_tokens(_dump(compacted)) <= CONTEXT_TOKENS:
                 return {key: _dump(value) for key, value in compacted.items()}
-    raise ValueError("Too many structured context fields to fit the Groq token budget.")
+    # Short strings still leave dictionary keys and repeated schemas. Remove
+    # low-priority detail only after ordinary compaction has been exhausted.
+    compacted = _compact(sections, 8, 1)
+    return _fit_structure(compacted)
+
+
+
+_CORE_FIELDS = {"problem", "proposed_solution", "mvp", "initial_opportunity",
+                "observed_gap", "evidence", "key_constraints", "resource_fit"}
+_CONSTRAINT_FIELDS = {"budget", "time", "time_available", "risk_tolerance",
+                      "location", "skills", "interests", "constraints"}
+
+
+def _has_identity(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(k in _IDENTITY_KEYS or _has_identity(v) for k, v in value.items())
+    if isinstance(value, list):
+        return any(_has_identity(v) for v in value)
+    return False
+
+
+def _fit_structure(sections: dict[str, Any]) -> dict[str, str]:
+    """Budget schema overhead without dropping named candidates or their links."""
+    bounded = copy.deepcopy(sections)
+    for value in bounded.values():
+        if isinstance(value, dict):
+            value["_budget_note"] = "Some details omitted; incomplete research context."
+    while count_tokens(_dump(bounded)) > CONTEXT_TOKENS:
+        choices = []
+        def visit(value, path=()):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    # Keep section roots, named records and actual user constraints.
+                    if (path and key not in _IDENTITY_KEYS
+                            and key not in _CONSTRAINT_FIELDS and key != "_budget_note"
+                            and not _has_identity(item)):
+                        priority = 1 if key in _CORE_FIELDS else 0
+                        cost = count_tokens(_dump({key: item}))
+                        choices.append((priority, -cost, repr(path + (key,)), value, key))
+                    visit(item, path + (key,))
+            elif isinstance(value, list):
+                for i, item in enumerate(value):
+                    visit(item, path + (i,))
+        visit(bounded)
+        if not choices:
+            raise ValueError("Candidate identities and user constraints alone exceed the context budget; reduce the number of candidates or shorten their names.")
+        # Prefer optional fields; within that group remove the largest first.
+        _, _, _, parent, key = min(choices, key=lambda x: x[:3])
+        del parent[key]
+    return {key: _dump(value) for key, value in bounded.items()}
 
 
 def validate_task(description: str) -> str:
